@@ -1,0 +1,106 @@
+name: Weekly Review Pulse
+
+on:
+  # ── Automated weekly trigger ─────────────────────────────────────────────
+  # Every Monday at 03:00 UTC  =  08:30 AM IST
+  schedule:
+    - cron: "0 3 * * 1"
+
+  # ── Manual trigger (backfill any week) ───────────────────────────────────
+  workflow_dispatch:
+    inputs:
+      week:
+        description: "ISO week to analyse (e.g. 2026-W26). Leave blank for current week."
+        required: false
+        default: ""
+      dry_run:
+        description: "Dry run — skip MCP delivery (doc append + email)"
+        type: boolean
+        required: false
+        default: false
+
+# Only one run at a time per product to avoid duplicate sections in the Doc.
+concurrency:
+  group: weekly-pulse-groww
+  cancel-in-progress: false
+
+jobs:
+  pulse:
+    name: Groww Weekly Pulse
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      # ── 1. Checkout ───────────────────────────────────────────────────────
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # ── 2. Set up Python ─────────────────────────────────────────────────
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      # ── 3. Cache pip dependencies ─────────────────────────────────────────
+      - name: Cache pip packages
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: pip-${{ runner.os }}-${{ hashFiles('requirements.txt', 'pyproject.toml') }}
+          restore-keys: |
+            pip-${{ runner.os }}-
+
+      # ── 4. Cache sentence-transformers model ──────────────────────────────
+      # Models are downloaded to ~/.cache/huggingface/hub on first run;
+      # caching avoids re-downloading 90 MB every week.
+      - name: Cache HuggingFace model cache
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/huggingface/hub
+          key: hf-models-bge-small-en-v1.5
+          restore-keys: |
+            hf-models-
+
+      # ── 5. Install dependencies ───────────────────────────────────────────
+      - name: Install project dependencies
+        run: pip install -e ".[dev]"
+
+      # ── 6. Run tests (fast gate — skip slow integration tests) ────────────
+      - name: Run unit tests
+        run: pytest tests/ -v --tb=short -q
+        env:
+          GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
+
+      # ── 7. Build CLI arguments ────────────────────────────────────────────
+      - name: Build CLI arguments
+        id: args
+        run: |
+          ARGS="--product groww"
+          if [ -n "${{ github.event.inputs.week }}" ]; then
+            ARGS="$ARGS --week ${{ github.event.inputs.week }}"
+          fi
+          if [ "${{ github.event.inputs.dry_run }}" = "true" ]; then
+            ARGS="$ARGS --dry-run"
+          fi
+          ARGS="$ARGS --verbose"
+          echo "cli_args=$ARGS" >> $GITHUB_OUTPUT
+
+      # ── 8. Run the Weekly Pulse pipeline ─────────────────────────────────
+      - name: Run Weekly Review Pulse
+        run: python -m src.agent.main ${{ steps.args.outputs.cli_args }}
+        env:
+          GROQ_API_KEY:        ${{ secrets.GROQ_API_KEY }}
+          MCP_API_SECRET_KEY:  ${{ secrets.MCP_API_SECRET_KEY }}
+          GOOGLE_DOC_ID:       ${{ secrets.GOOGLE_DOC_ID }}
+
+      # ── 9. Upload run log as artifact ─────────────────────────────────────
+      # Preserves the run_log.json for auditability even if the runs/ dir
+      # is gitignored and not committed.
+      - name: Upload run log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: run-log-${{ github.run_id }}
+          path: runs/
+          retention-days: 90
+          if-no-files-found: warn

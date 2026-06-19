@@ -1,0 +1,16 @@
+# Set default behaviour: normalise line endings to LF on check-in
+* text=auto eol=lf
+
+# Force these always LF (CI scripts, GitHub Actions)
+*.yml  text eol=lf
+*.yaml text eol=lf
+*.sh   text eol=lf
+
+# Binary files — no line-ending conversion
+*.png  binary
+*.jpg  binary
+*.jpeg binary
+*.gif  binary
+*.ico  binary
+*.whl  binary
+*.zip  binary
