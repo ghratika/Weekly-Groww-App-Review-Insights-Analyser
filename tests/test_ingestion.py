@@ -1,12 +1,11 @@
 """
-Unit tests for the review ingestion module (Phase 3).
+Unit tests for the review ingestion module.
 
-Tests use mocked MCP subprocess calls to avoid spawning real servers.
+Tests mock the underlying tool call to avoid real network requests.
 Covers:
   - Successful review fetch and Layer 2 PII scrubbing
   - 0-review response triggers RuntimeError abort
-  - MCP server subprocess failure raises ConnectionError
-  - MCP error response raises ValueError
+  - Tool errors (ValueError, ConnectionError) propagate correctly
   - Config parameters are passed correctly to the tool call
 """
 
@@ -15,7 +14,7 @@ from unittest.mock import patch, MagicMock
 
 import pytest
 
-from src.agent.ingestion import fetch_reviews_via_mcp, _parse_mcp_response
+from src.agent.ingestion import fetch_reviews_via_mcp
 
 
 # ---------------------------------------------------------------------------
@@ -77,54 +76,21 @@ def _make_review(review_id: str = "r1", text: str = "The app works really well f
     }
 
 
-# ---------------------------------------------------------------------------
-# Test: _parse_mcp_response
-# ---------------------------------------------------------------------------
-
-class TestParseMcpResponse:
-    def test_valid_result(self):
-        raw = json.dumps({"jsonrpc": "2.0", "id": 1, "result": {"data": 42}})
-        result = _parse_mcp_response(raw)
-        assert result == {"data": 42}
-
-    def test_json_rpc_error_raises(self):
-        raw = json.dumps({
-            "jsonrpc": "2.0", "id": 1,
-            "error": {"code": -32601, "message": "Method not found"}
-        })
-        with pytest.raises(ValueError, match="Method not found"):
-            _parse_mcp_response(raw)
-
-    def test_malformed_json_raises(self):
-        with pytest.raises(ValueError, match="Malformed JSON-RPC"):
-            _parse_mcp_response("not json at all")
+# Patch target: the tool function imported into ingestion.py
+_PATCH_TARGET = "src.agent.ingestion._tool_fetch_reviews"
 
 
 # ---------------------------------------------------------------------------
-# Test: fetch_reviews_via_mcp
+# Tests: fetch_reviews_via_mcp
 # ---------------------------------------------------------------------------
 
 class TestFetchReviewsViaMcp:
 
-    def _make_mcp_stdout(self, reviews: list[dict]) -> str:
-        """Build the stdout that the MCP server subprocess would emit."""
-        # Response to initialize (id=1)
-        init_response = json.dumps({"jsonrpc": "2.0", "id": 1, "result": {
-            "protocolVersion": "2024-11-05",
-            "capabilities": {},
-            "serverInfo": {"name": "playstore-reviews", "version": "1.0"},
-        }})
-        # Response to tools/call (id=2)
-        tool_response = json.dumps({"jsonrpc": "2.0", "id": 2, "result": {
-            "content": [{"type": "text", "text": json.dumps(reviews)}]
-        }})
-        return init_response + "\n" + tool_response + "\n"
-
-    @patch("src.agent.ingestion._call_mcp_tool_via_stdio")
-    def test_successful_fetch_returns_scrubbed_reviews(self, mock_mcp):
+    @patch(_PATCH_TARGET)
+    def test_successful_fetch_returns_scrubbed_reviews(self, mock_fetch):
         """Happy path: reviews are fetched and returned after Layer 2 PII scrub."""
         reviews = [_make_review("r1"), _make_review("r2")]
-        mock_mcp.return_value = reviews
+        mock_fetch.return_value = reviews
 
         result = fetch_reviews_via_mcp(_make_config())
 
@@ -132,22 +98,22 @@ class TestFetchReviewsViaMcp:
         assert result[0]["review_id"] == "r1"
         assert result[1]["review_id"] == "r2"
 
-    @patch("src.agent.ingestion._call_mcp_tool_via_stdio")
-    def test_zero_reviews_raises_runtime_error(self, mock_mcp):
+    @patch(_PATCH_TARGET)
+    def test_zero_reviews_raises_runtime_error(self, mock_fetch):
         """0 reviews → abort the run with RuntimeError (architecture §10)."""
-        mock_mcp.return_value = []
+        mock_fetch.return_value = []
 
         with pytest.raises(RuntimeError, match="No reviews returned"):
             fetch_reviews_via_mcp(_make_config())
 
-    @patch("src.agent.ingestion._call_mcp_tool_via_stdio")
-    def test_pii_in_text_is_scrubbed(self, mock_mcp):
+    @patch(_PATCH_TARGET)
+    def test_pii_in_text_is_scrubbed(self, mock_fetch):
         """Layer 2 PII scrubbing is applied: emails and phones are redacted."""
         reviews = [
             _make_review("r1", "Contact me at user@example.com for refund"),
             _make_review("r2", "Call 9876543210 for support"),
         ]
-        mock_mcp.return_value = reviews
+        mock_fetch.return_value = reviews
 
         result = fetch_reviews_via_mcp(_make_config())
 
@@ -156,63 +122,79 @@ class TestFetchReviewsViaMcp:
         assert "[REDACTED]" in result[0]["text"]
         assert "[REDACTED]" in result[1]["text"]
 
-    @patch("src.agent.ingestion._call_mcp_tool_via_stdio")
-    def test_non_pii_text_preserved(self, mock_mcp):
+    @patch(_PATCH_TARGET)
+    def test_non_pii_text_preserved(self, mock_fetch):
         """Reviews without PII have their text preserved exactly."""
         clean_text = "The SIP calculator is accurate and easy to use."
-        mock_mcp.return_value = [_make_review("r1", clean_text)]
+        mock_fetch.return_value = [_make_review("r1", clean_text)]
 
         result = fetch_reviews_via_mcp(_make_config())
 
         assert result[0]["text"] == clean_text
 
-    @patch("src.agent.ingestion._call_mcp_tool_via_stdio")
-    def test_connection_error_propagates(self, mock_mcp):
-        """ConnectionError from the MCP subprocess propagates to the caller."""
-        mock_mcp.side_effect = ConnectionError("Failed to start subprocess")
+    @patch(_PATCH_TARGET)
+    def test_connection_error_propagates(self, mock_fetch):
+        """ConnectionError from the tool propagates to the caller."""
+        mock_fetch.side_effect = ConnectionError("Network unavailable after retries")
 
-        with pytest.raises(ConnectionError, match="Failed to start subprocess"):
+        with pytest.raises(ConnectionError, match="Network unavailable"):
             fetch_reviews_via_mcp(_make_config())
 
-    @patch("src.agent.ingestion._call_mcp_tool_via_stdio")
-    def test_mcp_value_error_propagates(self, mock_mcp):
-        """ValueError from MCP error response propagates to the caller."""
-        mock_mcp.side_effect = ValueError("MCP server returned error: App not found")
+    @patch(_PATCH_TARGET)
+    def test_value_error_propagates(self, mock_fetch):
+        """ValueError from the tool (e.g., app not found) propagates to the caller."""
+        mock_fetch.side_effect = ValueError("App ID 'com.fake.app' not found on Google Play")
 
-        with pytest.raises(ValueError, match="App not found"):
+        with pytest.raises(ValueError, match="not found on Google Play"):
             fetch_reviews_via_mcp(_make_config())
 
-    @patch("src.agent.ingestion._call_mcp_tool_via_stdio")
-    def test_config_params_passed_to_mcp(self, mock_mcp):
+    @patch(_PATCH_TARGET)
+    def test_config_params_passed_to_tool(self, mock_fetch):
         """app_id, weeks, lang, and country are forwarded from config."""
-        mock_mcp.return_value = [_make_review()]
+        mock_fetch.return_value = [_make_review()]
         config = _make_config(app_id="com.zerodha.kite", weeks=8, lang="en", country="in")
 
         fetch_reviews_via_mcp(config)
 
-        call_kwargs = mock_mcp.call_args
-        assert call_kwargs.kwargs["tool_name"] == "fetch_reviews"
-        args = call_kwargs.kwargs["arguments"]
-        assert args["app_id"] == "com.zerodha.kite"
-        assert args["weeks"] == 8
-        assert args["lang"] == "en"
-        assert args["country"] == "in"
+        mock_fetch.assert_called_once_with(
+            app_id="com.zerodha.kite",
+            weeks=8,
+            lang="en",
+            country="in",
+        )
 
-    @patch("src.agent.ingestion._call_mcp_tool_via_stdio")
-    def test_unexpected_response_type_raises(self, mock_mcp):
-        """If MCP returns a non-list, a ValueError is raised."""
-        mock_mcp.return_value = {"error": "unexpected"}
+    @patch(_PATCH_TARGET)
+    def test_unexpected_response_type_raises(self, mock_fetch):
+        """If tool returns a non-list, a ValueError is raised."""
+        mock_fetch.return_value = {"error": "unexpected"}
 
         with pytest.raises(ValueError, match="Unexpected response type"):
             fetch_reviews_via_mcp(_make_config())
 
-    @patch("src.agent.ingestion._call_mcp_tool_via_stdio")
-    def test_author_fields_preserved(self, mock_mcp):
+    @patch(_PATCH_TARGET)
+    def test_author_fields_preserved(self, mock_fetch):
         """Layer 2 PII scrub must not touch the author field (already anonymized by L1)."""
         reviews = [_make_review("r1", "Good app, no issues at all")]
-        mock_mcp.return_value = reviews
+        mock_fetch.return_value = reviews
 
         result = fetch_reviews_via_mcp(_make_config())
 
         # Author was already anonymized by Layer 1; Layer 2 should not alter it
         assert result[0]["author"] == "User_abc123"
+
+    @patch(_PATCH_TARGET)
+    def test_default_lang_and_country_from_config(self, mock_fetch):
+        """If mcp_servers config is absent, defaults (en, in) are used."""
+        mock_fetch.return_value = [_make_review()]
+        config = _make_config()
+        # Remove mcp_servers section to test defaults
+        del config["mcp_servers"]
+
+        fetch_reviews_via_mcp(config)
+
+        mock_fetch.assert_called_once_with(
+            app_id="com.groww.v1",
+            weeks=12,
+            lang="en",
+            country="in",
+        )
