@@ -106,6 +106,13 @@ def _call_mcp_tool_via_stdio(
         ) from exc
 
     try:
+        # Build all JSON-RPC messages upfront and send them as a single
+        # stdin payload via communicate().  This is critical: calling
+        # process.stdin.close() manually *before* communicate() causes a
+        # double-close OSError ("I/O operation on closed file") because
+        # communicate() manages the pipe lifecycle internally.  Passing
+        # `input=` lets communicate() write → close → read atomically.
+
         # --- Step 1: initialize handshake ---
         init_request = _build_mcp_request(
             method="initialize",
@@ -116,7 +123,6 @@ def _call_mcp_tool_via_stdio(
             },
             request_id=1,
         )
-        process.stdin.write(init_request)
 
         # --- Step 2: initialized notification ---
         initialized_notif = json.dumps({
@@ -124,7 +130,6 @@ def _call_mcp_tool_via_stdio(
             "method": "notifications/initialized",
             "params": {},
         }) + "\n"
-        process.stdin.write(initialized_notif)
 
         # --- Step 3: tool call ---
         tool_request = _build_mcp_request(
@@ -132,12 +137,14 @@ def _call_mcp_tool_via_stdio(
             params={"name": tool_name, "arguments": arguments},
             request_id=2,
         )
-        process.stdin.write(tool_request)
-        process.stdin.flush()
-        process.stdin.close()
 
-        # --- Read all stdout ---
-        stdout_data, stderr_data = process.communicate(timeout=120)
+        # Concatenate all messages and let communicate() handle write+close+read
+        stdin_payload = init_request + initialized_notif + tool_request
+
+        # --- Send all requests and read all stdout atomically ---
+        stdout_data, stderr_data = process.communicate(
+            input=stdin_payload, timeout=120
+        )
 
     except subprocess.TimeoutExpired:
         process.kill()
