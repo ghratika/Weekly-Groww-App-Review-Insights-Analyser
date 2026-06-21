@@ -31,10 +31,12 @@ Authentication:
   The secret key is read from the ``MCP_API_SECRET_KEY`` environment variable.
 
 Allowed hosts:
-  FastMCP / Starlette's default ``TrustedHostMiddleware`` is NOT used here.
-  Railway terminates TLS at its edge and forwards requests with the original
-  ``Host`` header. We accept any host so Railway's proxy hostname
-  (``mcp-server-ghratika-production.up.railway.app``) is not rejected.
+  DNS rebinding protection is explicitly disabled via ``TransportSecuritySettings``
+  (``enable_dns_rebinding_protection=False``). Railway terminates TLS at its
+  edge and forwards requests with the real public ``Host`` header
+  (``mcp-server-ghratika-production.up.railway.app``). Without this setting,
+  FastMCP's ``TransportSecurityMiddleware`` would reject the request with 421
+  *before* the SSE connection is established.
 """
 
 from __future__ import annotations
@@ -130,9 +132,18 @@ def _build_mcp_server():
     stdio server (tools.py), so behaviour is identical between transports.
     """
     from mcp.server.fastmcp import FastMCP
+    from mcp.server.transport_security import TransportSecuritySettings
     from src.mcp_servers.playstore_reviews.tools import fetch_reviews, get_app_metadata
 
     port = int(os.environ.get("PORT", "8080"))
+
+    # Disable DNS rebinding / host-header validation.
+    # Railway terminates TLS at its edge and forwards the real public hostname
+    # (mcp-server-ghratika-production.up.railway.app) in the Host header.
+    # Without this, TransportSecurityMiddleware rejects the request with 421.
+    railway_security = TransportSecuritySettings(
+        enable_dns_rebinding_protection=False,
+    )
 
     mcp = FastMCP(
         name="playstore-reviews",
@@ -140,6 +151,7 @@ def _build_mcp_server():
         port=port,
         sse_path="/sse",
         message_path="/messages",
+        transport_security=railway_security,
     )
 
     @mcp.tool()
