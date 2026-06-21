@@ -5,14 +5,32 @@ Appends report sections to Google Docs and sends/drafts emails via the
 remote Railway SSE MCP server. Passes the MCP_API_SECRET_KEY as an
 Authorization: Bearer header for authentication.
 
-Note: Railway's proxy returns HTTP 421 with HTTP/2 SSE connections.
-We force HTTP/1.1 via a custom httpx transport to work around this.
+Railway proxy quirks
+--------------------
+Railway's reverse proxy returns HTTP 421 (Misdirected Request) and also
+rejects connections with an "Invalid Host header" error when clients use
+HTTP/2. Two compounding issues existed in the original factory:
+
+  1. ``_http1_client_factory`` was NOT a context manager — it returned a
+     bare ``httpx.AsyncClient``, not the ``async with``-able object that
+     ``sse_client`` expects from its ``httpx_client_factory`` callback.
+     This caused the SSE connection to bypass the factory entirely in
+     some MCP SDK versions and always use the default HTTP/2 client.
+
+  2. The factory silently discarded the ``headers``, ``auth``, and
+     ``timeout`` kwargs that ``sse_client`` passes in, so the
+     ``Authorization: Bearer`` token was never sent. Railway then
+     rejected the unauthenticated request before host-validation even ran.
+
+Fix: ``_http1_sse_client_factory`` is now a proper ``@asynccontextmanager``
+that forces ``http2=False`` and forwards all kwargs correctly.
 """
 
 from __future__ import annotations
 import asyncio
 import logging
 import os
+from contextlib import asynccontextmanager
 from typing import Any
 
 import httpx
@@ -31,12 +49,37 @@ def _unwrap_exception(exc: BaseException) -> BaseException:
     return exc
 
 
-def _http1_client_factory(**kwargs) -> httpx.AsyncClient:
-    """Factory that creates a fresh HTTP/1.1 client for each SSE connection.
-    Avoids Railway's 421 Misdirected Request caused by HTTP/2 multiplexing.
-    Ignores kwargs passed by sse_client (headers/auth/timeout) since we set them separately.
+@asynccontextmanager
+async def _http1_sse_client_factory(
+    headers: dict | None = None,
+    timeout: httpx.Timeout | None = None,
+    auth: httpx.Auth | None = None,
+):
     """
-    return httpx.AsyncClient(http2=False)
+    Async context-manager factory for MCP's ``httpx_client_factory`` hook.
+
+    Fixes two Railway-specific problems:
+      - Forces HTTP/1.1 (``http2=False``) to avoid Railway's 421
+        Misdirected Request on the ``/sse`` endpoint.
+      - Correctly forwards ``headers``, ``timeout``, and ``auth`` so
+        the ``Authorization: Bearer`` token is actually sent.
+
+    The ``@asynccontextmanager`` decorator is required because
+    ``sse_client`` uses the factory as ``async with factory(...) as client``.
+    """
+    client_kwargs: dict[str, Any] = {
+        "http2": False,
+        "follow_redirects": True,
+    }
+    if headers:
+        client_kwargs["headers"] = headers
+    if timeout is not None:
+        client_kwargs["timeout"] = timeout
+    if auth is not None:
+        client_kwargs["auth"] = auth
+
+    async with httpx.AsyncClient(**client_kwargs) as client:
+        yield client
 
 
 def _get_headers(config_section: dict) -> dict[str, str]:
@@ -73,7 +116,7 @@ async def _deliver_doc_async(doc_payload: dict, metadata: dict, config: dict) ->
 
     logger.debug("Connecting to Google Docs MCP server at %s", url)
     try:
-        async with sse_client(url, headers=headers, httpx_client_factory=_http1_client_factory) as streams:
+        async with sse_client(url, headers=headers, httpx_client_factory=_http1_sse_client_factory) as streams:
             async with ClientSession(streams[0], streams[1]) as session:
                 await session.initialize()
 
@@ -131,7 +174,7 @@ async def _deliver_email_async(
 
     logger.debug("Connecting to Gmail MCP server at %s", url)
     try:
-        async with sse_client(url, headers=headers, httpx_client_factory=_http1_client_factory) as streams:
+        async with sse_client(url, headers=headers, httpx_client_factory=_http1_sse_client_factory) as streams:
             async with ClientSession(streams[0], streams[1]) as session:
                 await session.initialize()
 
