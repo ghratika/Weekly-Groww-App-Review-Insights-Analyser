@@ -69,7 +69,11 @@ class Cluster:
 # Groq / LiteLLM constants
 # ---------------------------------------------------------------------------
 
-_MODEL = "groq/llama-3.3-70b-versatile"
+# Default model used when no config is provided (e.g. in direct unit-test calls).
+# At runtime, summarize_clusters() always builds the model string as
+# "<provider>/<model>" from config to guarantee litellm receives a
+# provider-qualified name (avoids BadRequestError: LLM Provider NOT provided).
+_DEFAULT_MODEL = "groq/llama-3.3-70b-versatile"
 _MAX_RETRIES = 3
 _BACKOFF_BASE = 2.0  # seconds
 
@@ -278,6 +282,8 @@ def _call_llm_with_retry(
     system_prompt: str,
     user_message: str,
     tracker: _RateLimitTracker,
+    *,
+    model: str = _DEFAULT_MODEL,
 ) -> dict:
     """
     Call the Groq LLM via litellm with up to 3 retries.
@@ -327,9 +333,9 @@ def _call_llm_with_retry(
         tracker.enforce_rpm_delay()
 
         try:
-            logger.debug("LLM call attempt %d/%d...", attempt, _MAX_RETRIES)
+            logger.debug("LLM call attempt %d/%d (model=%s)...", attempt, _MAX_RETRIES, model)
             response = litellm.completion(
-                model=_MODEL,
+                model=model,
                 messages=messages,
                 temperature=0.2,
                 max_tokens=800,
@@ -475,7 +481,9 @@ def summarize_clusters(
     For each cluster:
       1. Enforce TPM (rolling 60-second window) and RPM delays.
       2. Build prompt with review texts as structured JSON data.
-      3. Call ``groq/llama-3.3-70b-versatile`` via litellm (retry up to 3×).
+      3. Call the provider-qualified model (e.g. ``groq/llama-3.3-70b-versatile``)
+         via litellm (retry up to 3×). The model string is always built from
+         config as ``<provider>/<model>`` to avoid litellm BadRequestError.
          On RateLimitError, sleep for the ``retry-after`` duration Groq
          returns instead of applying blind exponential backoff.
       4. Parse JSON response → Cluster object.
@@ -494,11 +502,26 @@ def summarize_clusters(
     Raises:
         RuntimeError: If daily Groq rate limits are exceeded or all retries fail.
     """
+    # Build a provider-qualified model string so litellm always knows which
+    # backend to route to.  Config stores provider and model separately, e.g.
+    #   provider: "groq"
+    #   model:    "llama-3.3-70b-versatile"
+    # which must be combined as "groq/llama-3.3-70b-versatile" for litellm.
+    llm_cfg = config.get("llm", {})
+    provider = llm_cfg.get("provider", "groq")
+    bare_model = llm_cfg.get("model", "llama-3.3-70b-versatile")
+    # Only prepend the provider prefix if the model string does not already
+    # contain a slash (handles both bare names and already-qualified names).
+    if "/" in bare_model:
+        qualified_model = bare_model
+    else:
+        qualified_model = f"{provider}/{bare_model}"
+
     tracker = _RateLimitTracker(config)
     clusters: list[Cluster] = []
 
     logger.info(
-        "Summarizing %d clusters via %s...", len(raw_clusters), _MODEL
+        "Summarizing %d clusters via %s...", len(raw_clusters), qualified_model
     )
 
     for i, raw_cluster in enumerate(raw_clusters):
@@ -517,6 +540,7 @@ def summarize_clusters(
                 system_prompt=_SYSTEM_PROMPT,
                 user_message=user_msg,
                 tracker=tracker,
+                model=qualified_model,
             )
         except RuntimeError as exc:
             # Daily limit abort or total retry exhaustion — propagate up

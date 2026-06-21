@@ -65,11 +65,12 @@ jobs:
       - name: Install project dependencies
         run: pip install -e ".[dev]"
 
-      # ── 6. Run tests (fast gate — skip slow integration tests) ────────────
+      # ── 6. Run tests (fast gate — no live LLM calls) ─────────────────────
+      # IMPORTANT: GROQ_API_KEY is intentionally NOT injected here.
+      # All LLM calls in unit tests are mocked via patch.dict(sys.modules).
+      # Exposing a real key risks hitting provider rate limits during CI.
       - name: Run unit tests
         run: pytest tests/ -v --tb=short -q
-        env:
-          GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
 
       # ── 7. Build CLI arguments ────────────────────────────────────────────
       - name: Build CLI arguments
