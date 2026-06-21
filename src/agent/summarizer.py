@@ -6,8 +6,13 @@ For each RawCluster produced by the clustering engine, this module:
   2. Calls ``groq/llama-3.3-70b-versatile`` via ``litellm``.
   3. Parses the JSON response into a ``Cluster`` object with theme_name,
      summary, quotes, and action_ideas.
-  4. Enforces Groq free-tier rate limits with per-call delays and daily counters.
-  5. Retries up to 3× with exponential backoff on transient failures.
+  4. Enforces Groq free-tier rate limits:
+       - RPM  : minimum inter-call delay (60 s / safe_RPM).
+       - TPM  : rolling 60-second token-window; sleeps until window resets
+                whenever cumulative tokens would exceed the per-minute cap.
+       - Daily: requests and tokens tracked; aborts if exceeded.
+  5. Retries up to 3× on transient failures; on RateLimitError the
+     ``retry-after`` hint from Groq is parsed and honoured directly.
 
 Data models produced:
   ValidatedQuote: { text, review_id, rating }
@@ -17,14 +22,14 @@ Data models produced:
 Architecture references:
   - §4   — Analysis engine
   - §8.2 — Prompt injection safety (reviews as data, not in system prompt)
-  - §10  — Error handling: retry, rate-limit abort
-"""
+  - §10  — Error handling: retry, rate-limit abort"""
 
 from __future__ import annotations
 
 import json
 import logging
 import os
+import re
 import time
 from dataclasses import dataclass, field
 
@@ -70,6 +75,7 @@ _BACKOFF_BASE = 2.0  # seconds
 
 # Safety margin: leave 10% headroom below hard limits
 _SAFE_RPM = 27          # 30 * 0.9
+_SAFE_TPM = 10_800      # 12_000 * 0.9  — rolling per-minute token cap
 _SAFE_TPD = 90_000      # 100_000 * 0.9
 _SAFE_RPD = 900         # 1_000 * 0.9
 
@@ -79,6 +85,13 @@ _MIN_CALL_INTERVAL = 60.0 / _SAFE_RPM  # ~2.2 seconds
 # Maximum reviews to include per cluster call (to stay within 12K TPM)
 _MAX_REVIEWS_PER_CALL = 30
 _MAX_CHARS_PER_REVIEW = 400
+
+# Regex to extract a retry-after value from Groq's error messages.
+# Matches patterns like "Please try again in 970ms" or "try again in 1.5s".
+_RETRY_AFTER_RE = re.compile(
+    r"(?:try\s+again\s+in|retry\s+after)\s+([\d.]+)(ms|s)",
+    re.IGNORECASE,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -137,19 +150,84 @@ def _build_user_message(cluster: "RawCluster", reviews: list[dict]) -> str:  # t
 class _RateLimitTracker:
     """
     Tracks running totals of requests and tokens within a pipeline run.
-    Raises RuntimeError when daily Groq limits would be exceeded.
+
+    Enforces three Groq free-tier limits:
+      - RPM  : minimum inter-call wall-clock delay.
+      - TPM  : rolling 60-second token window; sleeps until the window
+               resets when cumulative minute-tokens would exceed the cap.
+      - Daily: raises RuntimeError when per-day limits are breached.
     """
+
+    _WINDOW_SECONDS = 60.0
 
     def __init__(self, config: dict):
         llm_cfg = config.get("llm", {})
         self.max_rpd: int = llm_cfg.get("requests_per_day", 1000)
         self.max_tpd: int = llm_cfg.get("tokens_per_day", 100_000)
+        self.max_tpm: int = llm_cfg.get("tokens_per_minute", 12_000)
+        # Apply safety margin to TPM read from config
+        self._safe_tpm: int = int(self.max_tpm * 0.9)
+
         self.requests_used: int = 0
         self.tokens_used: int = 0
+
+        # RPM tracking
         self._last_call_time: float = 0.0
 
+        # Rolling TPM window: list of (monotonic_timestamp, tokens) tuples
+        self._tpm_window: list[tuple[float, int]] = []
+
+    # ------------------------------------------------------------------
+    # Internal helpers
+    # ------------------------------------------------------------------
+
+    def _window_tokens(self, now: float) -> int:
+        """Return total tokens used within the current 60-second window."""
+        cutoff = now - self._WINDOW_SECONDS
+        self._tpm_window = [
+            (ts, toks) for ts, toks in self._tpm_window if ts > cutoff
+        ]
+        return sum(toks for _, toks in self._tpm_window)
+
+    # ------------------------------------------------------------------
+    # Public interface
+    # ------------------------------------------------------------------
+
+    def enforce_tpm_delay(self, estimated_tokens: int) -> None:
+        """
+        Sleep until there is enough TPM headroom for the next call.
+
+        ``estimated_tokens`` should be a conservative upper-bound of the
+        tokens the upcoming call will consume (prompt + expected completion).
+        If the current rolling window already has too many tokens, this
+        method sleeps until the oldest entries fall outside the 60-second
+        window and headroom is restored.
+        """
+        while True:
+            now = time.monotonic()
+            used_in_window = self._window_tokens(now)
+            headroom = self._safe_tpm - used_in_window
+            if headroom >= estimated_tokens:
+                break
+            # Find when the oldest entry in the window will expire
+            if self._tpm_window:
+                oldest_ts = self._tpm_window[0][0]
+                sleep_for = max(0.1, (oldest_ts + self._WINDOW_SECONDS) - now)
+            else:
+                sleep_for = self._WINDOW_SECONDS
+            logger.info(
+                "TPM headroom insufficient (%d available, %d needed). "
+                "Sleeping %.1fs for window to reset.",
+                headroom, estimated_tokens, sleep_for,
+            )
+            time.sleep(sleep_for)
+
+    def record_tpm_usage(self, tokens: int) -> None:
+        """Record actual tokens used by a completed call into the rolling window."""
+        self._tpm_window.append((time.monotonic(), tokens))
+
     def check_and_record(self, tokens_used: int) -> None:
-        """Record a completed call. Raises RuntimeError if limits are exceeded."""
+        """Record a completed call. Raises RuntimeError if daily limits are exceeded."""
         self.requests_used += 1
         self.tokens_used += tokens_used
 
@@ -170,7 +248,7 @@ class _RateLimitTracker:
         elapsed = now - self._last_call_time
         if elapsed < _MIN_CALL_INTERVAL:
             sleep_for = _MIN_CALL_INTERVAL - elapsed
-            logger.debug("Rate-limit delay: sleeping %.2fs before next call.", sleep_for)
+            logger.debug("RPM delay: sleeping %.2fs before next call.", sleep_for)
             time.sleep(sleep_for)
         self._last_call_time = time.monotonic()
 
@@ -179,13 +257,38 @@ class _RateLimitTracker:
 # LLM call with retry
 # ---------------------------------------------------------------------------
 
+def _parse_retry_after(exc: Exception) -> float | None:
+    """
+    Extract the retry-after wait time (in seconds) from a Groq RateLimitError.
+
+    Groq embeds a human-readable hint in the error message, e.g.:
+      "Please try again in 970ms" or "Please try again in 1.5s".
+    Returns None if no hint is found.
+    """
+    msg = str(exc)
+    match = _RETRY_AFTER_RE.search(msg)
+    if not match:
+        return None
+    value = float(match.group(1))
+    unit = match.group(2).lower()
+    return value / 1000.0 if unit == "ms" else value
+
+
 def _call_llm_with_retry(
     system_prompt: str,
     user_message: str,
     tracker: _RateLimitTracker,
 ) -> dict:
     """
-    Call the Groq LLM via litellm with up to 3 retries and exponential backoff.
+    Call the Groq LLM via litellm with up to 3 retries.
+
+    Retry strategy:
+      - RateLimitError: parse the ``retry-after`` hint from Groq and sleep
+        exactly that long (+ 1 s buffer). Falls back to 65 s if no hint.
+      - JSONDecodeError: retry immediately (no extra sleep).
+      - All other errors: exponential backoff (2^attempt seconds).
+
+    TPM and RPM enforcement (via tracker) happens *before* each attempt.
 
     Args:
         system_prompt: The system-turn text.
@@ -206,6 +309,12 @@ def _call_llm_with_retry(
             "Install with: pip install litellm"
         ) from exc
 
+    # Conservative upper-bound for TPM pre-flight check:
+    # prompt ≈ len(user_message)/4 chars-per-token + system prompt + max completion
+    estimated_prompt_tokens = (
+        len(system_prompt) // 4 + len(user_message) // 4 + 800
+    )
+
     messages = [
         {"role": "system", "content": system_prompt},
         {"role": "user", "content": user_message},
@@ -213,7 +322,10 @@ def _call_llm_with_retry(
 
     last_exc: Exception | None = None
     for attempt in range(1, _MAX_RETRIES + 1):
+        # Enforce per-minute limits before each attempt
+        tracker.enforce_tpm_delay(estimated_prompt_tokens)
         tracker.enforce_rpm_delay()
+
         try:
             logger.debug("LLM call attempt %d/%d...", attempt, _MAX_RETRIES)
             response = litellm.completion(
@@ -229,32 +341,65 @@ def _call_llm_with_retry(
             usage = response.usage
             tokens = (usage.total_tokens if usage else 0)
 
+            tracker.record_tpm_usage(tokens)
             tracker.check_and_record(tokens)
             logger.debug(
-                "LLM call succeeded (attempt %d). Tokens used: %d (total: %d).",
+                "LLM call succeeded (attempt %d). Tokens used: %d (run total: %d).",
                 attempt, tokens, tracker.tokens_used,
             )
 
             return json.loads(content)
 
         except RuntimeError:
-            # Rate-limit abort — do not retry
+            # Daily-limit abort — do not retry
             raise
+
         except json.JSONDecodeError as exc:
             logger.warning(
                 "LLM returned invalid JSON (attempt %d/%d): %s",
                 attempt, _MAX_RETRIES, exc,
             )
             last_exc = exc
+            # No extra sleep needed — just retry with same prompt
+
         except Exception as exc:
-            delay = _BACKOFF_BASE ** attempt
-            logger.warning(
-                "LLM call failed (attempt %d/%d), retrying in %.1fs: %s",
-                attempt, _MAX_RETRIES, delay, exc,
-            )
             last_exc = exc
-            if attempt < _MAX_RETRIES:
-                time.sleep(delay)
+            error_str = str(exc)
+
+            # Check if this is a rate-limit error
+            is_rate_limit = (
+                "rate_limit" in error_str.lower()
+                or "RateLimitError" in type(exc).__name__
+                or "429" in error_str
+            )
+
+            if is_rate_limit:
+                retry_after = _parse_retry_after(exc)
+                if retry_after is not None:
+                    sleep_for = retry_after + 1.0  # 1 s safety buffer
+                    logger.warning(
+                        "Rate limit hit (attempt %d/%d). Groq says retry in %.2fs. "
+                        "Sleeping %.2fs.",
+                        attempt, _MAX_RETRIES, retry_after, sleep_for,
+                    )
+                else:
+                    # No hint — wait a full window to be safe
+                    sleep_for = 65.0
+                    logger.warning(
+                        "Rate limit hit (attempt %d/%d), no retry-after hint. "
+                        "Sleeping %.0fs to reset TPM window.",
+                        attempt, _MAX_RETRIES, sleep_for,
+                    )
+                if attempt < _MAX_RETRIES:
+                    time.sleep(sleep_for)
+            else:
+                delay = _BACKOFF_BASE ** attempt
+                logger.warning(
+                    "LLM call failed (attempt %d/%d), retrying in %.1fs: %s",
+                    attempt, _MAX_RETRIES, delay, exc,
+                )
+                if attempt < _MAX_RETRIES:
+                    time.sleep(delay)
 
     raise RuntimeError(
         f"LLM summarization failed after {_MAX_RETRIES} attempts. "
@@ -328,9 +473,11 @@ def summarize_clusters(
     Summarize each RawCluster into a named, quoted Cluster using Groq LLM.
 
     For each cluster:
-      1. Enforce RPM rate-limit delay.
+      1. Enforce TPM (rolling 60-second window) and RPM delays.
       2. Build prompt with review texts as structured JSON data.
       3. Call ``groq/llama-3.3-70b-versatile`` via litellm (retry up to 3×).
+         On RateLimitError, sleep for the ``retry-after`` duration Groq
+         returns instead of applying blind exponential backoff.
       4. Parse JSON response → Cluster object.
       5. Track token and request usage; abort if daily limits exceeded.
 
