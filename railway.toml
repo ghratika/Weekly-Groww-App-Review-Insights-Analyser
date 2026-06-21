@@ -1,0 +1,23 @@
+# railway.toml — Railway deployment configuration
+#
+# This file tells Railway how to build and start the MCP SSE server.
+#
+# The server binds to $PORT (provided by Railway) and serves the MCP
+# SSE protocol at /sse. All other requests receive 404 or 401.
+#
+# Environment variables required in Railway dashboard:
+#   MCP_API_SECRET_KEY   — shared secret for Bearer token auth
+#
+# Local test:
+#   PORT=8080 python -m src.mcp_servers.playstore_reviews.sse_server
+#   curl http://localhost:8080/health
+
+[build]
+builder = "nixpacks"
+
+[deploy]
+startCommand = "python -m src.mcp_servers.playstore_reviews.sse_server"
+healthcheckPath = "/health"
+healthcheckTimeout = 30
+restartPolicyType = "on_failure"
+restartPolicyMaxRetries = 3
