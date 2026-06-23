@@ -130,12 +130,40 @@ async def _deliver_doc_async(doc_payload: dict, metadata: dict, config: dict) ->
                     return f"heading={heading}"
 
                 # Append the section
-                logger.info("Appending section to Google Doc...")
-                await session.call_tool("update_document", arguments={
+                logger.info(
+                    "Appending section to Google Doc (doc_id=%s, text_len=%d chars)...",
+                    doc_id, len(raw_markdown),
+                )
+                if not raw_markdown:
+                    raise ValueError(
+                        "_raw_markdown is empty in doc_payload — nothing to write. "
+                        "Check that render_doc_section populated _raw_markdown and "
+                        "that the run log JSON preserved it correctly."
+                    )
+                update_res = await session.call_tool("update_document", arguments={
                     "document_id": doc_id,
                     "text": raw_markdown + "\n\n",   # tool param is "text", not "content"
                     "mode": "append"
                 })
+                # Log the raw MCP response so Railway logs show exactly what the
+                # Docs API replied (characters_written, replies[], status).
+                update_text = update_res.content[0].text if update_res.content else "{}"
+                logger.info("update_document response: %s", update_text)
+
+                # Fail loudly if the tool reported writing 0 characters.
+                import json as _json
+                try:
+                    update_data = _json.loads(update_text)
+                    chars = update_data.get("characters_written", -1)
+                    if chars == 0:
+                        raise RuntimeError(
+                            f"update_document reported characters_written=0. "
+                            f"Full response: {update_text}"
+                        )
+                    logger.info("Confirmed %d characters written to Google Doc.", chars)
+                except (_json.JSONDecodeError, AttributeError):
+                    logger.warning("Could not parse update_document response as JSON: %s", update_text)
+
                 logger.info("Successfully appended to Google Doc.")
                 return f"heading={heading}"
     except Exception as exc:
