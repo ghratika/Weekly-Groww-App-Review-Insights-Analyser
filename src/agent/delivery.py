@@ -133,7 +133,7 @@ async def _deliver_doc_async(doc_payload: dict, metadata: dict, config: dict) ->
                 logger.info("Appending section to Google Doc...")
                 await session.call_tool("update_document", arguments={
                     "document_id": doc_id,
-                    "content": raw_markdown + "\n\n",
+                    "text": raw_markdown + "\n\n",   # tool param is "text", not "content"
                     "mode": "append"
                 })
                 logger.info("Successfully appended to Google Doc.")
